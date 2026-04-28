@@ -1,5 +1,23 @@
+// ════════════════════════════════════════════════════════════════
+//  schema.prisma — JobElearningPlatform-TS
+//  Refactor of: https://github.com/pereiratc/jobElearningPortal
+//
+//  CHANGES vs original JS schema (marked with 🔧):
+//  🔧 RoleAssignment: added @@unique([userId, role]) — prevents duplicate roles
+//  🔧 Application:    added @@unique([userId, jobId]) — prevents duplicate applications
+//                     removed redundant `appliedAt` (same data as `createdAt`)
+//                     renamed AppStatus → ApplicationStatus (more explicit in TS)
+//  🔧 CourseMedia:    added `order Int` and `isFree Boolean` for preview support
+//  🔧 Progress:       kept as 1:1 with Enrollment (% float) — simple and clear
+//                     NOTE: upgrade to per-lesson tracking when Lesson model is added
+//  ✅ Kept from original: planStartDate/planExpiresAt on User, Testimonial,
+//     Resume.parsedData + filled, Skill.slug, Course.approved + promoActive,
+//     Certificate linked to User+Course directly with url for PDF
+// ════════════════════════════════════════════════════════════════
+
 generator client {
   provider = "prisma-client-js"
+  // Explicit output path — required for Turborepo monorepo structure
   output   = "../node_modules/.prisma/client"
 }
 
@@ -8,52 +26,373 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ════════════════════════════════════════════════════════════════
+//  ENUMS
+// ════════════════════════════════════════════════════════════════
+
+/// Roles a user can hold. Multiple roles supported via RoleAssignment pivot.
+enum Role {
+  SUPERADMIN // Full system access — developer level
+  ADMIN      // Platform administration
+  CANDIDATE  // Applies to jobs and enrolls in courses
+  RECRUITER  // Creates and manages job listings
+  TRAINER    // Creates and manages courses
+}
+
+/// Status of a job application
+/// 🔧 Renamed from AppStatus → ApplicationStatus for clarity in TypeScript
+enum ApplicationStatus {
+  PENDING
+  REVIEWED  // 🔧 Added — was missing from the original JS schema
+  ACCEPTED
+  REJECTED
+}
+
+/// Media types supported inside a course
+enum MediaType {
+  VIDEO
+  PRESENTATION
+  TEXT
+  QUIZ
+  YOUTUBE_LINK
+  GITHUB_REPO
+  OTHER
+}
+
+/// Whether a course is free or paid
+enum CourseType {
+  FREE
+  PREMIUM
+}
+
+/// Subscription plan types
+enum PlanType {
+  FREE         // Apply to jobs
+  EXPERIMENTAL // Create jobs & courses for 7 days
+  PRO          // Premium courses + authenticated certificates
+  EMPRESA      // Corporate — manage jobs and courses
+}
+
+/// Status of a course enrollment
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+// ════════════════════════════════════════════════════════════════
+//  USER & ACCESS CONTROL
+// ════════════════════════════════════════════════════════════════
+
+/// Platform user — can hold any combination of roles via RoleAssignment
 model User {
-  id           String           @id @default(cuid())
-  email        String           @unique
-  password     String
-  name         String
-  role         RoleAssignment[]
-  jobs         Job[]            @relation("UserJobs")
-  courses      Course[]         @relation("TrainerCourses")
-  applications Application[]    @relation("UserApplications") // <- adicionado
-  createdAt    DateTime         @default(now())
-}
-
-model Application {
-  id        String   @id @default(cuid())
-  message   String?
-  user      User     @relation("UserApplications", fields: [userId], references: [id])
-  userId    String
-  job       Job      @relation(fields: [jobId], references: [id])
-  jobId     String
-  status    String   @default("pending")
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String   @unique
+  password  String
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Plan ──────────────────────────────────────────────────────
+  // Stored directly on User to avoid extra joins in middleware checks
+  planId        Int?
+  plan          Plan?     @relation(fields: [planId], references: [id])
+  planStartDate DateTime?
+  planExpiresAt DateTime? // Used by checkPlanExpiration middleware
+
+  // ── Relations ─────────────────────────────────────────────────
+  roles          RoleAssignment[]
+  resumes        Resume[]
+  applications   Application[]
+  enrollments    Enrollment[]
+  progress       Progress[]      @relation("UserProgress")
+  jobs           Job[]           @relation("RecruiterJobs")
+  createdCourses Course[]        @relation("CreatedCourses")
+  skills         UserSkill[]
+  certificates   Certificate[]
+  company        Company?
+  testimonials   Testimonial[]
 }
 
+/// Pivot table: User ↔ Role (N-to-N)
+/// 🔧 Added @@unique([userId, role]) — the original JS schema was missing this,
+///    which allowed the same role to be assigned to a user multiple times.
 model RoleAssignment {
-  id     String @id @default(cuid())
-  role   String
-  user   User   @relation(fields: [userId], references: [id])
-  userId String
+  id        Int      @id @default(autoincrement())
+  role      Role
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, role])
 }
 
+// ════════════════════════════════════════════════════════════════
+//  PLANS
+// ════════════════════════════════════════════════════════════════
+
+/// Subscription plans — controls feature access across the platform
+model Plan {
+  id            Int      @id @default(autoincrement())
+  name          String   @unique  // e.g. "Free", "Pro", "Empresa"
+  type          PlanType @unique
+  features      String?           // Human-readable feature list
+  price         Float?            // null = free
+  expiresInDays Int?              // null = unlimited (FREE & EMPRESA)
+  createdAt     DateTime @default(now())
+
+  users User[]
+}
+
+// ════════════════════════════════════════════════════════════════
+//  COMPANY
+// ════════════════════════════════════════════════════════════════
+
+/// Company profile — 1:1 with a User who holds the RECRUITER role
+model Company {
+  id        Int      @id @default(autoincrement())
+  name      String
+  logo      String?
+  website   String?
+  createdAt DateTime @default(now())
+
+  // 1:1 — one User owns one Company profile
+  userId Int  @unique
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  jobs Job[]
+}
+
+// ════════════════════════════════════════════════════════════════
+//  JOB PORTAL
+// ════════════════════════════════════════════════════════════════
+
+/// Job listing created by a Recruiter
 model Job {
-  id          String   @id @default(cuid())
+  id          Int      @id @default(autoincrement())
   title       String
   description String
+  // Denormalized company name for fast display (original JS pattern kept)
   company     String
-  recruiter   User     @relation("UserJobs", fields: [recruiterId], references: [id])
-  recruiterId String
-  applications Application[]
+  location    String?
+  salary      Float?
+  isRemote    Boolean  @default(false)
+  isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Recruiter who posted the job
+  recruiterId Int
+  recruiter   User @relation("RecruiterJobs", fields: [recruiterId], references: [id])
+
+  // Optional link to a Company profile
+  companyId Int?
+  companyData Company? @relation(fields: [companyId], references: [id])
+
+  applications Application[]
+  skills       JobSkill[]
 }
 
+/// A candidate's application for a job
+/// 🔧 Added @@unique([userId, jobId]) — enforces no duplicate applications at DB level.
+///    This is what the original test "❌ Dupla candidatura" was validating in code only.
+/// 🔧 Removed redundant `appliedAt` — `createdAt` serves the same purpose.
+model Application {
+  id        Int               @id @default(autoincrement())
+  status    ApplicationStatus @default(PENDING)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  userId Int
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  jobId Int
+  job   Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, jobId])
+}
+
+// ════════════════════════════════════════════════════════════════
+//  RESUME
+// ════════════════════════════════════════════════════════════════
+
+/// Resume file uploaded by a Candidate (Cloudinary or local)
+model Resume {
+  id         Int      @id @default(autoincrement())
+  url        String           // Cloudinary URL or local path
+  filename   String?
+  parsedData Json?            // Structured JSON from resume parser
+  filled     Int    @default(0) // Completeness score 0-100
+  uploadedAt DateTime @default(now())
+
+  userId Int
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  skills Skill[] @relation("ResumeSkills")
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SKILLS
+// ════════════════════════════════════════════════════════════════
+
+/// A skill that can come from a Resume, a Course, or be added manually
+model Skill {
+  id   Int    @id @default(autoincrement())
+  name String @unique
+  slug String @unique // URL-safe identifier (e.g. "node-js", "react")
+
+  resumes   Resume[]    @relation("ResumeSkills")
+  courses   Course[]    @relation("CourseSkills")
+  users     UserSkill[]
+  jobs      JobSkill[]
+}
+
+/// Pivot: User ↔ Skill — skills consolidated from CV + completed courses
+model UserSkill {
+  userId     Int
+  skillId    Int
+  assignedAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  skill Skill @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@id([userId, skillId])
+}
+
+/// Pivot: Job ↔ Skill — skills required for a job listing
+model JobSkill {
+  jobId   Int
+  skillId Int
+
+  job   Job   @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  skill Skill @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@id([jobId, skillId])
+}
+
+// ════════════════════════════════════════════════════════════════
+//  E-LEARNING
+// ════════════════════════════════════════════════════════════════
+
+/// Course created by a Trainer
 model Course {
-  id          String   @id @default(cuid())
-  title       String
-  description String
-  trainer     User     @relation("TrainerCourses", fields: [trainerId], references: [id])
-  trainerId   String
-  createdAt   DateTime @default(now())
+  id               Int        @id @default(autoincrement())
+  title            String
+  description      String
+  type             CourseType @default(FREE)
+  price            Float?              // null if FREE
+  commission       Float?  @default(0.30) // 30% platform fee on sales
+  previewAvailable Boolean    @default(false) // Free preview for PREMIUM courses
+  promoActive      Boolean    @default(false) // Promotional pricing active
+  approved         Boolean    @default(false) // Must be approved by ADMIN before publish
+  thumbnail        String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  // Trainer who created the course
+  creatorId Int
+  creator   User @relation("CreatedCourses", fields: [creatorId], references: [id])
+
+  skills       Skill[]       @relation("CourseSkills")
+  media        CourseMedia[]
+  enrollments  Enrollment[]
+  progresses   Progress[]
+  certificates Certificate[]
+}
+
+/// Media item inside a course (video, quiz, text, etc.)
+/// 🔧 Added `order Int` — for controlling display sequence (was missing in original)
+/// 🔧 Added `isFree Boolean` — marks individual items available as course preview
+model CourseMedia {
+  id        Int       @id @default(autoincrement())
+  type      MediaType
+  url       String
+  title     String?
+  order     Int       // Display order within the course
+  isFree    Boolean   @default(false) // Available without enrollment (preview)
+  createdAt DateTime  @default(now())
+
+  courseId Int
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+}
+
+/// Student enrollment in a course
+model Enrollment {
+  id         Int              @id @default(autoincrement())
+  status     EnrollmentStatus @default(ACTIVE)
+  enrolledAt DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  userId Int
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  courseId Int
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  progresses Progress[]
+
+  @@unique([userId, courseId])
+}
+
+/// Course progress — tracks completion % per enrollment
+/// NOTE: This is a 1:1 per-enrollment design (simple %).
+///       When CourseMedia items have granular tracking, consider
+///       moving to a per-media-item progress model instead.
+model Progress {
+  id           Int       @id @default(autoincrement())
+  percentage   Float     @default(0)   // 0.0 → 100.0
+  completedAt  DateTime?               // Set when percentage reaches 100
+  updatedAt    DateTime  @updatedAt
+
+  enrollmentId Int        @unique
+  enrollment   Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+
+  courseId Int
+  course   Course @relation(fields: [courseId], references: [id])
+
+  userId Int
+  user   User @relation("UserProgress", fields: [userId], references: [id])
+}
+
+// ════════════════════════════════════════════════════════════════
+//  CERTIFICATES  (Pro plan only)
+// ════════════════════════════════════════════════════════════════
+
+/// Authenticated certificate issued on course completion (Pro plan)
+/// Linked directly to User + Course for fast lookup (no join via Enrollment needed)
+model Certificate {
+  id        Int      @id @default(autoincrement())
+  // Unique code used for public verification (e.g. /verify/:code)
+  code      String   @unique @default(cuid())
+  url       String            // Cloudinary URL of the generated PDF certificate
+  issuedAt  DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId Int
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  courseId Int
+  course   Course @relation(fields: [courseId], references: [id])
+
+  // One certificate per user per course
+  @@unique([userId, courseId])
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MISC
+// ════════════════════════════════════════════════════════════════
+
+/// Testimonials shown on the platform landing page
+model Testimonial {
+  id        Int      @id @default(autoincrement())
+  name      String
+  role      String
+  quote     String
+  avatar    String?
+  createdAt DateTime @default(now())
+
+  // Optional: link to a real user
+  userId Int?
+  user   User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 }
